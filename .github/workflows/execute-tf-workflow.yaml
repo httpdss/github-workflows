@@ -150,7 +150,7 @@ jobs:
       if: failure()
       with:
         repo-token: ${{ secrets.gh-token }}
-        message-id: ${{ github.event.pull_request.number }}/${{ env.working-directory}}
+        message-id: ${{ github.event.pull_request.number }}/${{ inputs.working-directory }}
         update-only: true
         find: |
           :orange_circle: Applying plan generated in:
@@ -161,7 +161,7 @@ jobs:
       uses: mshick/add-pr-comment@v2
       with:
         repo-token: ${{ secrets.gh-token }}
-        message-id: ${{ github.event.pull_request.number }}/${{ env.working-directory}}
+        message-id: ${{ github.event.pull_request.number }}/${{ inputs.working-directory }}
         update-only: true
         find: |
           :orange_circle: Applying plan generated in:
