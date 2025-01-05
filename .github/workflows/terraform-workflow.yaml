@@ -1,18 +1,9 @@
-name: 'terraform-workflows'
-
+name: 'execute-tf-workflow'
 on:
   workflow_call:
     inputs:
       working-directory:
         description: 'The working directory for the terraform workflow'
-        required: true
-        type: string
-      force-apply:
-        required: false
-        description: 'Force apply terraform changes'
-        type: boolean
-      runner:
-        description: 'The runner to use for the workflow'
         required: true
         type: string
       apply-branch:
@@ -21,23 +12,46 @@ on:
         default: 'refs/heads/main'
         type: string
     secrets:
-      repo-token:
+      gh-token:
         description: 'The GitHub token for the repository'
         required: true
 
 jobs:
   terraform:
-    name: 'run-terraform'
-    runs-on: ${{ inputs.runner }}
+    name: 'Terraform CI'
+    runs-on: ubuntu-latest
     defaults:
       run:
         working-directory: ${{ inputs.working-directory }}
-
     steps:
-    - name: Checkout
-      uses: actions/checkout@v3
+    - name: Job summary inputs
+      run: |
+        echo "### Job Inputs" >> $GITHUB_STEP_SUMMARY
+        echo "Working Directory: \`${{ inputs.working-directory }}\`" >> $GITHUB_STEP_SUMMARY
+        echo "Apply Branch: \`${{ inputs.apply-branch }}\`" >> $GITHUB_STEP_SUMMARY
 
-    - uses: hashicorp/setup-terraform@v2
+    - name: Checkout
+      uses: actions/checkout@v4
+
+    - uses: hashicorp/setup-terraform@v3
+
+    - name: Configure Terraform plugin cache
+      run: |
+        mkdir -p ~/.terraform.d/plugin-cache
+
+    - name: Cache Terraform plugins
+      uses: actions/cache@v4
+      with:
+        path: ~/.terraform.d/plugin-cache
+        key: ${{ runner.os }}-terraform-${{ hashFiles('.terraform.lock.hcl') }}
+        restore-keys: ${{ runner.os }}-terraform-
+
+    - name: Login to aws
+      uses: aws-actions/configure-aws-credentials@v2
+      with:
+        aws-access-key-id: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        aws-secret-access-key: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        aws-region: us-east-1
 
     - name: Terraform fmt
       id: fmt
@@ -46,11 +60,10 @@ jobs:
 
     - name: Terraform Init
       id: init
-      run: terraform init
-
-    # - name: Invalidate lock
-    #   id: invalidate-lock
-    #   run: terraform force-unlock -force XXXXXXX-XXXX-XXXX-XXXX-XXXXXXXXXXXX
+      run: |
+        # Alternative to ~/.terraformrc file
+        export TF_PLUGIN_CACHE_DIR="${HOME}/.terraform.d/plugin-cache"
+        terraform init
 
     - name: Terraform Validate
       id: validate
@@ -59,33 +72,98 @@ jobs:
     - name: Terraform Plan
       id: plan
       run: terraform plan -no-color
-      continue-on-error: true
 
     - name: Reformat Plan
       id: colored-plan
       run: |
-        echo '${{ steps.plan.outputs.stdout || steps.plan.outputs.stderr }}'' \
-        | sed -E 's/^([[:space:]]+)([-+])/\2\1/g' > plan.txt
+        echo '${{ steps.plan.outputs.stdout || steps.plan.outputs.stderr }}' | sed -E '
+          # Process lines that begin with whitespace followed by +, -, or ~
+          s/^([[:space:]]+)([-+~])/\2\1/g;
+          s/^([[:space:]]*~)/!\1/g;
+          s/\{\{/\{\{/g;
+          s/\}\}/\}\}/g' > plan.txt
 
     - name: Put Plan in Env Var
+      id: set-plan-env
       run: |
-        PLAN=$(cat plan.txt)
+        PLAN=$(sed -n '/^Terraform will perform the following actions:/,$p' plan.txt)
+        PLAN_LENGTH=${#PLAN}
+        MAX_PLAN_LENGTH=60000
+
+        if [ "$PLAN_LENGTH" -gt "$MAX_PLAN_LENGTH" ]; then
+          echo "Plan is too long, trimming output..."
+          PLAN=$(echo "$PLAN" | head -c $MAX_PLAN_LENGTH && echo -e "\n... Plan is too long, check the generated artifact plan.txt to see all the details.")
+        fi
+
         echo "PLAN<<EOF" >> $GITHUB_ENV
         echo "$PLAN" >> $GITHUB_ENV
         echo "EOF" >> $GITHUB_ENV
 
-    - name: Post Plan and Apply to GitHub PR
-      uses: mshick/add-pr-comment@v1
+        PLAN_STATS=$(grep "Plan:" plan.txt || echo "No changes. Your infrastructure matches the configuration.")
+        echo "PLAN_STATS=$PLAN_STATS" >> $GITHUB_ENV
+
+        echo "PLAN=$PLAN" >> $GITHUB_OUTPUT
+        echo "PLAN_STATS=$PLAN_STATS" >> $GITHUB_OUTPUT
+
+    - name: Upload plan
+      id: upload-plan
+      uses: actions/upload-artifact@v4
       with:
-        repo-token: ${{ secrets.repo-token }}
-        repo-token-user-login: 'github-actions[bot]'
+        name: plan
+        path: plan.txt
+
+
+    - name: Post Plan and Apply to GitHub PR
+      uses: mshick/add-pr-comment@v2
+      with:
+        repo-token: ${{ secrets.gh-token }}
+        refresh-message-position: true
+        message-id: ${{ github.event.pull_request.number }}/${{ inputs.working-directory}}
         message: |
-          Plan for **${{ inputs.working-directory }}**:
+          <details>
+          <summary>Plan for <strong>${{inputs.working-directory}}</strong>:</summary>
 
           ```diff
-          ${{ env.PLAN }}
+          ${{ steps.set-plan-env.outputs.PLAN }}
           ```
+          </details>
+
+          ${{ steps.set-plan-env.outputs.PLAN_STATS }}
+
+          :memo: Plan generated in: [plan-workflow #${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }})
+          :file_folder: Plan File [#Download](${{ steps.upload-plan.outputs.artifact-url }})
 
     - name: Terraform Apply
-      if: (github.ref == inputs.apply-branch && github.event_name == 'push') || inputs.force-apply == 'true'
+      if: github.ref == inputs.apply-branch && github.event_name == 'push'
       run: terraform apply -auto-approve
+
+    - name: Show output on step summary
+      run: |
+        terraform output -no-color | tee output.log
+        echo "### Terraform Output" >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+        cat output.log >> $GITHUB_STEP_SUMMARY
+        echo '```' >> $GITHUB_STEP_SUMMARY
+
+    - name: Post Failed to GitHub PR
+      uses: mshick/add-pr-comment@v2
+      if: failure()
+      with:
+        repo-token: ${{ secrets.gh-token }}
+        message-id: ${{ github.event.pull_request.number }}/${{ env.working-directory}}
+        update-only: true
+        find: |
+          :orange_circle: Applying plan generated in:
+        replace: |
+          :x: Failed to apply: [apply-workflow #${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) plan generated in:
+
+    - name: Post Applied to GitHub PR
+      uses: mshick/add-pr-comment@v2
+      with:
+        repo-token: ${{ secrets.gh-token }}
+        message-id: ${{ github.event.pull_request.number }}/${{ env.working-directory}}
+        update-only: true
+        find: |
+          :orange_circle: Applying plan generated in:
+        replace: |
+          :white_check_mark: Applied within workflow: [apply-workflow #${{ github.run_number }}](${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}) plan generated in:

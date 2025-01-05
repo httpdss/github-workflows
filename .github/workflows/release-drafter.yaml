@@ -12,10 +12,7 @@ jobs:
   update_release_draft:
     runs-on: ubuntu-latest
     permissions:
-      # write permission is required to create a github release
       contents: write
-      # write permission is required for autolabeler
-      # otherwise, read permission is required at least
       pull-requests: write
     steps:
       - name: Checkout
@@ -26,7 +23,7 @@ jobs:
         id: release-drafter
         with:
           config-name: release-drafter.yml
-          publish: true
+          publish: false
           prerelease: false
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
